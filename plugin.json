@@ -3,17 +3,24 @@
   "name": "Pixiv 图片搜索",
   "author": "woqichino",
   "description": "从 Pixiv 搜索高人气图片，支持关键词搜索、收藏数过滤、排除标签、R-18 控制、去重缓存。",
-  "tags": ["图片", "Pixiv", "娱乐", "二次元"],
-  "source": "https://github.com/woqichino/Alife.Plugin.PixivSearcher",
   "dependencies": {
     "Alife.Function.FunctionCaller": ">=1.0.0"
   },
   "environments": {},
+  "tags": [
+    "图片",
+    "Pixiv",
+    "娱乐",
+    "二次元"
+  ],
+  "source": "https://github.com/woqichino/Alife.Plugin.PixivSearcher",
   "releases": {
-    "1.1.0": {
-      "date": "2026-07-05",
+    "1.2.0": {
+      "date": "2026-07-06",
       "note": "v1.1.0：增加 R-18/R-18G 开关控制、去重缓存、纯 C# 实现。",
-      "file": "https://github.com/woqichino/Alife.Plugin.PixivSearcher/releases/download/v1.1.0/Alife.Plugin.PixivSearcher-1.1.0.zip"
+      "file": "https://github.com/woqichino/Alife.Plugin.PixivSearcher/releases/download/v1.1.0/Alife.Plugin.PixivSearcher-1.2.0.zip",
+      "dependencies": null,
+      "environments": null
     }
   }
 }
