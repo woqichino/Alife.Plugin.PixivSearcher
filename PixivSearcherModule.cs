@@ -31,8 +31,8 @@ public class PixivSearcherData
     [Description("排除标签（逗号分隔）")]
     public string ExcludeTags { get; set; } = "AI,R-18,裸足";
 
-    [Description("图片缓存目录")]
-    public string ImageStorageDir { get; set; } = "files/pixiv";
+    [Description("图片缓存目录（留空则使用插件目录下的 pixiv 文件夹）")]
+    public string ImageStorageDir { get; set; } = "";
 
     [Description("最大搜索页数")]
     public int MaxSearchPages { get; set; } = 10;
@@ -72,6 +72,7 @@ public class PixivSearcherModule(
     private static DateTime _cacheLoadTime = DateTime.MinValue;
     private static readonly object _cacheLock = new();
     private static string _cacheFilePath = "";
+    private static string _pluginDir = "";
 
     private class ImageInfo
     {
@@ -87,8 +88,23 @@ public class PixivSearcherModule(
         await base.AwakeAsync(context);
         functionService.RegisterHandler(new XmlHandler(this));
         
+        _pluginDir = Path.Combine(AlifePath.StorageFolderPath, "Plugins", "Alife.Plugin.PixivSearcher");
+        
         var cfg = Configuration ?? new PixivSearcherData();
-        _cacheFilePath = Path.Combine(AlifePath.StorageFolderPath, cfg.ImageStorageDir!, "sent_cache.json");
+        
+        string cacheDir;
+        if (!string.IsNullOrEmpty(cfg.ImageStorageDir))
+        {
+            cacheDir = Path.Combine(AlifePath.StorageFolderPath, cfg.ImageStorageDir);
+        }
+        else
+        {
+            cacheDir = Path.Combine(_pluginDir, "pixiv");
+        }
+        
+        _cacheFilePath = Path.Combine(cacheDir, "sent_cache.json");
+        
+        Directory.CreateDirectory(cacheDir);
         
         LoadCache();
         logger.LogInformation("[PixivSearcher] 初始化完成，缓存文件: {CacheFile}，已加载 {Count} 条记录", _cacheFilePath, _sentCache.Count);
@@ -199,9 +215,6 @@ public class PixivSearcherModule(
         }
     }
 
-    /// <summary>
-    /// 搜索用户，返回用户 ID
-    /// </summary>
     private async Task<int?> SearchUserAsync(HttpClient client, string userName, PixivSearcherData cfg)
     {
         try
@@ -212,7 +225,6 @@ public class PixivSearcherModule(
                 ["sort"] = "popular_desc",
             };
             var qs = string.Join("&", query.Select(p => $"{Uri.EscapeDataString(p.Key)}={Uri.EscapeDataString(p.Value)}"));
-            // 🔑 使用 /v1/search/user 接口
             var resp = await client.GetAsync($"{_baseUrl}/v1/search/user?{qs}");
             resp.EnsureSuccessStatusCode();
             var json = await resp.Content.ReadAsStringAsync();
@@ -238,9 +250,6 @@ public class PixivSearcherModule(
         }
     }
 
-    /// <summary>
-    /// 根据用户 ID 获取作品
-    /// </summary>
     private async Task<List<(JsonElement Illust, int Bookmarks)>> SearchArtistAsync(HttpClient client, int artistId, int count, PixivSearcherData cfg, bool skipSent = false)
     {
         var result = new List<(JsonElement, int)>();
@@ -400,6 +409,69 @@ public class PixivSearcherModule(
         return null;
     }
 
+    private async Task<JsonElement?> GetIllustByIdAsync(HttpClient client, long pid)
+    {
+        try
+        {
+            var url = $"{_baseUrl}/v1/illust/detail?illust_id={pid}";
+            logger.LogInformation("[PixivSearcher] 请求 PID 接口: {Url}", url);
+            
+            var resp = await client.GetAsync(url);
+            logger.LogInformation("[PixivSearcher] 响应状态码: {StatusCode}", resp.StatusCode);
+            
+            if (resp.StatusCode == System.Net.HttpStatusCode.NotFound)
+            {
+                logger.LogWarning("[PixivSearcher] 作品 {Pid} 不存在（404）", pid);
+                return null;
+            }
+            
+            resp.EnsureSuccessStatusCode();
+            var json = await resp.Content.ReadAsStringAsync();
+            logger.LogInformation("[PixivSearcher] 响应内容: {Json}", json.Length > 500 ? json.Substring(0, 500) + "..." : json);
+            
+            var doc = JsonDocument.Parse(json);
+            
+            // 🔑 检查是否有 error 字段
+            if (doc.RootElement.TryGetProperty("error", out var errorElem) && errorElem.ValueKind != JsonValueKind.Null)
+            {
+                var errorMsg = errorElem.TryGetProperty("message", out var msgElem) ? msgElem.GetString() : "未知错误";
+                logger.LogWarning("[PixivSearcher] API 返回错误: {Error}", errorMsg);
+                return null;
+            }
+            
+            // 🔑 检查是否有 illust 字段（Pixiv App-API 的标准格式）
+            if (doc.RootElement.TryGetProperty("illust", out var illust) && illust.ValueKind == JsonValueKind.Object)
+            {
+                return illust;
+            }
+            
+            // 🔑 检查是否有 body 字段
+            if (doc.RootElement.TryGetProperty("body", out var body) && body.ValueKind == JsonValueKind.Object)
+            {
+                return body;
+            }
+            
+            // 🔑 如果直接返回的是 illust 对象（没有 body 或 illust 包裹）
+            if (doc.RootElement.ValueKind == JsonValueKind.Object && doc.RootElement.TryGetProperty("id", out _))
+            {
+                return doc.RootElement;
+            }
+            
+            logger.LogWarning("[PixivSearcher] 响应格式异常，无法解析");
+            return null;
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            logger.LogWarning("[PixivSearcher] 作品 {Pid} 不存在（404）", pid);
+            return null;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "[PixivSearcher] 获取 PID {Pid} 失败", pid);
+            return null;
+        }
+    }
+
     [XmlFunction(FunctionMode.OneShot)]
     [Description("从 Pixiv 搜索高人气图片并发送到当前聊天")]
     public async Task Pixivsearch(
@@ -447,8 +519,17 @@ public class PixivSearcherModule(
 
             var selectedIllusts = filteredIllusts.Take(count).ToList();
 
-            var storageDir = Path.Combine(AlifePath.StorageFolderPath, cfg.ImageStorageDir!);
+            string storageDir;
+            if (!string.IsNullOrEmpty(cfg.ImageStorageDir))
+            {
+                storageDir = Path.Combine(AlifePath.StorageFolderPath, cfg.ImageStorageDir);
+            }
+            else
+            {
+                storageDir = Path.Combine(_pluginDir, "pixiv");
+            }
             Directory.CreateDirectory(storageDir);
+
             var imageInfos = new List<ImageInfo>();
             var r18Blocked = 0;
             var r18gBlocked = 0;
@@ -510,6 +591,7 @@ public class PixivSearcherModule(
             foreach (var info in imageInfos)
             {
                 msgLines.Add($"📁 {info.Path}");
+                msgLines.Add($"🆔 PID：{info.Id}");
                 msgLines.Add($"⭐ 收藏数：{info.Bookmarks}");
                 msgLines.Add("");
             }
@@ -559,7 +641,6 @@ public class PixivSearcherModule(
             client.DefaultRequestHeaders.Add("User-Agent", "PixivAndroidApp/5.0.234 (Android 11; Pixel 5)");
             client.DefaultRequestHeaders.Add("Referer", "https://app-api.pixiv.net/");
 
-            // 🔑 第一步：搜索用户获取 ID
             var userId = await SearchUserAsync(client, artistName, cfg);
             if (userId == null)
             {
@@ -567,7 +648,6 @@ public class PixivSearcherModule(
                 return;
             }
 
-            // 🔑 第二步：根据用户 ID 获取作品
             var illustsWithBookmarks = await SearchArtistAsync(client, userId.Value, count * 3, cfg, true);
             var filteredIllusts = illustsWithBookmarks
                 .Where(item => !IsSent(item.Illust.GetProperty("id").GetInt32().ToString()))
@@ -581,8 +661,17 @@ public class PixivSearcherModule(
 
             var selectedIllusts = filteredIllusts.Take(count).ToList();
 
-            var storageDir = Path.Combine(AlifePath.StorageFolderPath, cfg.ImageStorageDir!);
+            string storageDir;
+            if (!string.IsNullOrEmpty(cfg.ImageStorageDir))
+            {
+                storageDir = Path.Combine(AlifePath.StorageFolderPath, cfg.ImageStorageDir);
+            }
+            else
+            {
+                storageDir = Path.Combine(_pluginDir, "pixiv");
+            }
             Directory.CreateDirectory(storageDir);
+
             var imageInfos = new List<ImageInfo>();
             var r18Blocked = 0;
             var r18gBlocked = 0;
@@ -644,6 +733,7 @@ public class PixivSearcherModule(
             foreach (var info in imageInfos)
             {
                 msgLines.Add($"📁 {info.Path}");
+                msgLines.Add($"🆔 PID：{info.Id}");
                 msgLines.Add($"⭐ 收藏数：{info.Bookmarks}");
                 msgLines.Add("");
             }
@@ -655,6 +745,124 @@ public class PixivSearcherModule(
         catch (Exception ex)
         {
             logger.LogError(ex, "[PixivSearcher] 画师搜索失败");
+            Poke($"error: {ex.Message}");
+        }
+    }
+
+    [XmlFunction(FunctionMode.OneShot)]
+    [Description("通过作品 PID 获取单张图片（如：pid 12345678）")]
+    public async Task PixivsearchPid(
+        [Description("作品 PID（如 12345678）")] long pid,
+        [Description("是否发送原图")] bool original = false)
+    {
+        var cfg = Configuration ?? new PixivSearcherData();
+        try
+        {
+            if (string.IsNullOrEmpty(cfg.RefreshToken))
+            { Poke("error: 未配置 Refresh Token"); return; }
+
+            if (cfg.DedupHours > 0 && (DateTime.Now - _cacheLoadTime).TotalHours > cfg.DedupHours)
+            {
+                LoadCache();
+            }
+
+            var handler = string.IsNullOrEmpty(cfg.Proxy)
+                ? new HttpClientHandler()
+                : new HttpClientHandler { Proxy = new System.Net.WebProxy(cfg.Proxy) };
+            using var client = new HttpClient(handler);
+            client.DefaultRequestHeaders.Add("User-Agent", "PixivAndroidApp/5.0.234 (Android 11; Pixel 5)");
+            client.DefaultRequestHeaders.Add("Referer", "https://app-api.pixiv.net/");
+
+            var token = await AuthAsync(client, cfg.RefreshToken);
+            if (token == null)
+            { Poke("error: Token 认证失败"); return; }
+
+            client.DefaultRequestHeaders.Clear();
+            client.DefaultRequestHeaders.Add("Authorization", $"Bearer {token}");
+            client.DefaultRequestHeaders.Add("User-Agent", "PixivAndroidApp/5.0.234 (Android 11; Pixel 5)");
+            client.DefaultRequestHeaders.Add("Referer", "https://app-api.pixiv.net/");
+
+            var illust = await GetIllustByIdAsync(client, pid);
+            if (illust == null)
+            {
+                Poke($"❌ 未找到作品 PID: {pid}");
+                return;
+            }
+
+            var id = illust.Value.GetProperty("id").GetInt32().ToString();
+            if (IsSent(id))
+            {
+                Poke($"🔁 作品 {pid} 已发送过，不会重复发送（去重缓存）");
+                return;
+            }
+
+            int xRestrict = 0;
+            if (illust.Value.TryGetProperty("x_restrict", out var xRestrictElement))
+            {
+                if (xRestrictElement.ValueKind == JsonValueKind.Number)
+                    xRestrict = xRestrictElement.GetInt32();
+                else if (xRestrictElement.ValueKind == JsonValueKind.String)
+                    int.TryParse(xRestrictElement.GetString(), out xRestrict);
+            }
+
+            var isR18 = xRestrict == 1;
+            var isR18G = xRestrict == 2;
+
+            if (isR18 && !cfg.AllowR18InPrivate)
+            {
+                Poke($"🚫 作品 {pid} 为 R-18，当前禁止发送");
+                return;
+            }
+            if (isR18G && !cfg.AllowR18GInPrivate)
+            {
+                Poke($"🚫 作品 {pid} 为 R-18G，当前禁止发送");
+                return;
+            }
+
+            int bookmarks = 0;
+            if (illust.Value.TryGetProperty("total_bookmarks", out var bookmarkElem))
+            {
+                if (bookmarkElem.ValueKind == JsonValueKind.Number)
+                    bookmarks = bookmarkElem.GetInt32();
+                else if (bookmarkElem.ValueKind == JsonValueKind.String)
+                    int.TryParse(bookmarkElem.GetString(), out bookmarks);
+            }
+
+            string storageDir;
+            if (!string.IsNullOrEmpty(cfg.ImageStorageDir))
+            {
+                storageDir = Path.Combine(AlifePath.StorageFolderPath, cfg.ImageStorageDir);
+            }
+            else
+            {
+                storageDir = Path.Combine(_pluginDir, "pixiv");
+            }
+            Directory.CreateDirectory(storageDir);
+
+            var imgUrl = GetImageUrl(illust.Value, original || cfg.DownloadOriginal);
+            if (string.IsNullOrEmpty(imgUrl))
+            {
+                Poke($"❌ 无法获取作品 {pid} 的图片链接");
+                return;
+            }
+
+            var path = await DownloadAsync(client, imgUrl, id, storageDir);
+            if (path == null)
+            {
+                Poke($"❌ 下载作品 {pid} 失败");
+                return;
+            }
+
+            MarkSent(id);
+
+            var msg = $"🖼️ 作品 {pid}\n📁 {path}\n⭐ 收藏数：{bookmarks}";
+            Poke(msg);
+            
+            logger.LogInformation("[PixivSearcher] PID 搜索完成: {Pid}", pid);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "[PixivSearcher] PID 搜索失败");
             Poke($"error: {ex.Message}");
         }
     }
